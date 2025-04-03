@@ -1,0 +1,853 @@
+Directory structure:
+└── lehai0609-bayesian-football/
+    ├── README.md
+    ├── Data Preprocessing 4.Rmd
+    ├── Finaldata4c_complete.csv
+    ├── Model_code.Rmd
+    ├── all_incidents.csv
+    └── extract_data_sqlite.R
+
+================================================
+File: README.md
+================================================
+# Football-forecasting-Bayesian
+### Replication code for the article ''Real-time forecasting within soccer matches through a Bayesian lens"
+
+The data used is publicly available on Kaggle (link: https://www.kaggle.com/datasets/hugomathien/soccer). We first extract the required data from the sqlite file on Kaggle using : extract_data_sqlite.R .
+Further preprocessing is done on the data to get it into a usable format, with the output file to be used for implementing the models being: Finaldata4c_complete.csv. The code used for preprocessing is given in Data Preprocessing 4.Rmd.
+The proposed model is provided in Model_code.Rmd. The metrics derived from the model output is given in model_metrics.rds.
+The comparative approaches used are provided in the codes Comparator I.Rmd , Comparator II.Rmd and Comparator III.Rmd, with the outputs being Comparator1.Rdata and Comparator3d.Rdata.
+
+
+
+================================================
+File: Data Preprocessing 4.Rmd
+================================================
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r warning=FALSE}
+library(reshape2)
+library(dplyr)
+library(tidyverse)
+library(tidyr)
+library(R2OpenBUGS)
+library(coda)
+```
+
+#Outcome variable created from all_incidents dataset (card variable split in two)
+
+```{r}
+data_all_goalcard = read.csv("all_incidents.csv",header = TRUE)
+
+data_all_card = data_all_goalcard%>% filter((type == "goal" & (subtype1 =="n"|subtype1 =="o"|subtype1 =="p"))| type != "goal") #Remove all goal subtype1's except o,n,p
+data_all = data_all_card%>% filter((type == "card" & !is.na(subtype1))|type != "card") #Remove all NA card subtype1's
+data = data_all
+data$type = ifelse(data$type == "card" & data$subtype1 == "y","card_y",data$type) #Separating red and yellow cards
+```
+
+```{r}
+data_y = read.csv("matchdetails.csv",header = TRUE)
+```
+
+```{r}
+data_x = read.csv("player_details.csv",header=TRUE)
+```
+
+#Changing team id for "o" subtype goals(owngoals)
+
+```{r}
+data_chg = merge(data,data_y[,c(1,8,9)],by.x = "game_id",by.y = "id")
+data_chg$team1 = ifelse(data_chg$type == "goal" & data_chg$subtype1 == "o" & data_chg$team == data_chg$home_team_api_id,data_chg$away_team_api_id,ifelse(data_chg$type == "goal" & data_chg$subtype1 == "o" & data_chg$team == data_chg$away_team_api_id,data_chg$home_team_api_id,data_chg$team))
+data_chg1 = data_chg[,-8]
+names(data_chg1)[names(data_chg1) == "team1"] <- "team"
+```
+
+```{r}
+data1_pre = data_chg1[,c(3,14,10,1)] #Removing columns not required
+```
+
+```{r}
+data1 = data1_pre %>% filter(data1_pre$type != "special") #Removing speicals because of all zero columns
+s = split(x = data1, f = data1$type) #Splitting dataset by type of event
+
+#length(unique(s$goal$game_id))
+```
+
+Adding Home/Away status for teams and sorting by game and Home/Away such that home is first for each game & type
+
+```{r}
+data_ha1 = data_y[,c(1,8)]
+data_ha1$indicator_ha = 1
+colnames(data_ha1) = c("game_id","team","Indicator_HA")
+data_ha2 = data_y[,c(1,9)] 
+data_ha2$indicator_ha = 2
+colnames(data_ha2) = c("game_id","team","Indicator_HA")
+data_ha3 = rbind(data_ha1,data_ha2)
+data_ha4 = data_ha3[order(data_ha3$game_id,data_ha3$Indicator_HA),]
+
+data1ab = merge(data1,data_ha4)
+data1ab = data1ab[order(data1ab$type,data1ab$game_id,data1ab$Indicator_HA),]
+data1a = data1ab #Removing indicator after ordering
+```
+
+```{r}
+u_type = unique(data1a$type)
+s8 = list()
+
+for (j in 1:length(u_type)) {
+
+u_game = unique(data1a$game_id)
+s7 = list()
+
+for (i in 1:length(u_game)) {
+#------------------------------------------------------#
+s1 = subset(data1a,data1a$game_id == u_game[i] & data1a$type == u_type[j])
+u_team = unique(s1$team)
+
+if(length(u_team) == 2) {
+
+s1_a = subset(s1,s1$team == u_team[1])
+t1_a = table(s1_a$elapsed)
+s1_a = s1_a %>% distinct(team,elapsed, .keep_all = TRUE)
+s1_a$count = as.integer(t1_a)
+
+
+s2_a = data.frame("game_id" = rep(u_game[i],90), "elapsed" = 1:90, "count" = NA)
+s3_a = merge(s2_a,s1_a,by = c("elapsed"),all =T)
+s4_a = s3_a[,(names(s3_a) %in% c("elapsed","game_id.x","game_id.y","count.y"))]
+s5_a = dcast(s4_a,s4_a$game_id.x~s4_a$elapsed,value.var = "count.y")
+colnames(s5_a) <- paste0("Home",colnames(s5_a))
+#-------------------------------------------------------#
+
+s1_b = subset(s1,s1$team == u_team[2])
+t1_b = table(s1_b$elapsed) #Gives counts of event at each time. Corrects for instances where we have same event happen many times in the same minute.
+s1_b = s1_b %>% distinct(team,elapsed, .keep_all = TRUE)
+s1_b$count = as.integer(t1_b)
+
+
+s2_b = data.frame("game_id" = rep(u_game[i],90), "elapsed" = 1:90, "count" = NA)
+s3_b = merge(s2_b,s1_b,by = c("elapsed"),all =T)
+s4_b = s3_b[,(names(s3_b) %in% c("elapsed","game_id.x","game_id.y","count.y"))]
+s5_b = dcast(s4_b,s4_b$game_id.x~s4_b$elapsed,value.var = "count.y")
+colnames(s5_b) <- paste0("Away",colnames(s5_b))
+#------------------------------------------------------#
+s6 = cbind(s5_a,s5_b)
+colnames(s6)[1] <- "game_id"
+s7[[i]] = s6[-92]
+#------------------------------------------------------#
+}
+
+if(length(u_team) == 1 & s1$Indicator_HA[1] == 1) {
+
+s1_a = subset(s1,s1$team == u_team[1])
+t1_a = table(s1_a$elapsed)
+s1_a = s1_a %>% distinct(team,elapsed, .keep_all = TRUE)
+s1_a$count = as.integer(t1_a)
+
+
+s2_a = data.frame("game_id" = rep(u_game[i],90), "elapsed" = 1:90, "count" = NA)
+s3_a = merge(s2_a,s1_a,by = c("elapsed"),all =T)
+s4_a = s3_a[,(names(s3_a) %in% c("elapsed","game_id.x","game_id.y","count.y"))]
+#s4_a = s3_a[c(1,2,5,8)]
+s5_a = dcast(s4_a,s4_a$game_id.x~s4_a$elapsed,value.var = "count.y")
+colnames(s5_a) <- paste0("Home",colnames(s5_a))
+
+s2_b = data.frame("game_id" = rep(u_game[i],90), "elapsed" = 1:90, "count" = NA)
+s5_b = dcast(s2_b,s2_b$game_id~s2_b$elapsed,value.var = "count")
+colnames(s5_b) <- paste0("Away",colnames(s5_b))
+#------------------------------------------------------#
+s6 = cbind(s5_a,s5_b)
+colnames(s6)[1] <- "game_id"
+s7[[i]] = s6[-92]
+#------------------------------------------------------#
+}
+
+if(length(u_team) == 1 & s1$Indicator_HA[1] == 2) {
+
+s1_a = subset(s1,s1$team == u_team[1])
+t1_a = table(s1_a$elapsed)
+s1_a = s1_a %>% distinct(team,elapsed, .keep_all = TRUE)
+s1_a$count = as.integer(t1_a)
+
+
+s2_a = data.frame("game_id" = rep(u_game[i],90), "elapsed" = 1:90, "count" = NA)
+s3_a = merge(s2_a,s1_a,by = c("elapsed"),all =T)
+s4_a = s3_a[,(names(s3_a) %in% c("elapsed","game_id.x","game_id.y","count.y"))]
+s5_a = dcast(s4_a,s4_a$game_id.x~s4_a$elapsed,value.var = "count.y")
+colnames(s5_a) <- paste0("Away",colnames(s5_a))
+
+s2_b = data.frame("game_id" = rep(u_game[i],90), "elapsed" = 1:90, "count" = NA)
+s5_b = dcast(s2_b,s2_b$game_id~s2_b$elapsed,value.var = "count")
+colnames(s5_b) <- paste0("Home",colnames(s5_b))
+#------------------------------------------------------#
+s6 = cbind(s5_b,s5_a)
+colnames(s6)[1] <- "game_id"
+s7[[i]] = s6[-92]
+#------------------------------------------------------#
+                                                  }
+
+
+}
+s8[[j]] = s7 %>% bind_rows()
+colnames(s8[[j]]) <- paste0(u_type[j],colnames(s8[[j]]))
+}
+#s9 = s8 %>% bind_cols(id = "game_id")
+```
+
+#Creating a complete dataset from list
+
+```{r}
+s9_a = merge(s8[[1]],s8[[2]],by.x = "cardgame_id",by.y = "card_ygame_id",all = TRUE)
+s9_b = merge(s9_a,s8[[3]],by.x = "cardgame_id",by.y = "cornergame_id",all = TRUE)
+s9_c = merge(s9_b,s8[[4]],by.x = "cardgame_id",by.y = "crossgame_id",all = TRUE)
+s9_d = merge(s9_c,s8[[5]],by.x = "cardgame_id",by.y = "foulcommitgame_id",all = TRUE)
+s9_e = merge(s9_d,s8[[6]],by.x = "cardgame_id",by.y = "goalgame_id",all = TRUE)
+s9_f = merge(s9_e,s8[[7]],by.x = "cardgame_id",by.y = "shotoffgame_id",all = TRUE)
+s9_g = merge(s9_f,s8[[8]],by.x = "cardgame_id",by.y = "shotongame_id",all = TRUE)
+s9 = merge(s9_g,s8[[9]],by.x = "cardgame_id",by.y = "throwingame_id",all = TRUE)
+```
+
+```{r}
+s9[is.na(s9)] <- 0
+s10 = s9
+```
+
+```{r}
+data_y1 = data_y %>% dplyr::select(id, home_team_api_id, away_team_api_id, home_team_goal, away_team_goal)
+colnames(data_y1) <- c("ID","Home Team ID","Away Team ID","Home_goals","Away_goals")
+```
+
+```{r}
+s11 = merge(s9,data_y1,by.x = "cardgame_id",by.y = "ID")
+
+s11$Outcome = ifelse(s11$Home_goals > s11$Away_goals,1,ifelse(s11$Home_goals == s11$Away_goals,0,-1))
+
+s12 = s11[,!(colnames(s11) %in% c("Home Team ID", "Away Team ID","Home_goals","Away_goals"))]
+```
+
+Adding overall variable to the dataset
+
+```{r}
+#Obtaining relevant variables
+
+data_y_subset = data_y[,c(1,6:9,56:77)]
+data_x_subset = data_x[,c(3:5)] 
+
+#For each game finding player in data_x and then adding appropriate overall after comparing the dates of the overall rating and game. Looping this over all 22 players in the game and then further over all 3040 matches.
+
+for(i in 1:3040){
+  for(j in 6:27){
+  
+data_x_subset1 = data_x_subset %>% filter(player_api_id == data_y_subset[i,j])
+
+if(length(data_x_subset1$date) > 0) {
+data_x_subset1$date_y = data_y_subset$date[i]
+data_x_subset2 = data_x_subset1[order(data_x_subset1$date),]
+data_x_subset2$indicator = ifelse(data_x_subset2$date >= data_x_subset2$date_y, 1,0)
+data_x_subset3 = data_x_subset2 %>% group_by(indicator) %>% filter(row_number() == n() & indicator == 0)
+data_y_subset[i,j+22] = data_x_subset3$overall_rating
+}
+
+if(length(data_x_subset1$date) == 0) {
+  data_y_subset[i,j+22] = 0
+  }
+
+colnames(data_y_subset)[j+22] = paste0(colnames(data_y_subset[j]),"_ovr")
+}
+}
+
+#Obtaining row and away overall means
+data_y_subset_final = data_y_subset
+data_y_subset_final[,28:49][data_y_subset_final[,28:49] == 0] <- NA
+data_y_subset_final$Home_overall_mean = rowMeans(data_y_subset[,c(28:38)],na.rm = TRUE)
+data_y_subset_final$Away_overall_mean = rowMeans(data_y_subset[,c(39:48)],na.rm = TRUE)
+
+overall_avg_data = data_y_subset_final[,c(1,50,51)]
+
+```
+
+```{r}
+#Merging avg data with main data wrt game ID
+s12_b = merge(s12,overall_avg_data,by.x = "cardgame_id",by.y = "id")
+```
+
+```{r}
+
+columns_to_remove <- grep("_id", names(s12_b))
+s13 = s12_b %>% dplyr::select(-columns_to_remove)
+```
+
+```{r}
+d = duplicated(s13) #Search for row duplicates
+d1 = duplicated(t(s13)) #Search for column duplicates
+d2 = s13[d]
+d3 = s13[d1]
+d4 = colnames(d3)
+
+s14_b = s13 %>% dplyr::select(-d4) #Data without duplicates with response variable
+```
+
+```{r}
+write.csv(s13,"Finaldata4c_complete.csv", row.names = TRUE)
+```
+
+
+
+================================================
+File: Finaldata4c_complete.csv
+================================================
+,cardHome1,cardHome2,cardHome3,cardHome4,cardHome5,cardHome6,cardHome7,cardHome8,cardHome9,cardHome10,cardHome11,cardHome12,cardHome13,cardHome14,cardHome15,cardHome16,cardHome17,cardHome18,cardHome19,cardHome20,cardHome21,cardHome22,cardHome23,cardHome24,cardHome25,cardHome26,cardHome27,cardHome28,cardHome29,cardHome30,cardHome31,cardHome32,cardHome33,cardHome34,cardHome35,cardHome36,cardHome37,cardHome38,cardHome39,cardHome40,cardHome41,cardHome42,cardHome43,cardHome44,cardHome45,cardHome46,cardHome47,cardHome48,cardHome49,cardHome50,cardHome51,cardHome52,cardHome53,cardHome54,cardHome55,cardHome56,cardHome57,cardHome58,cardHome59,cardHome60,cardHome61,cardHome62,cardHome63,cardHome64,cardHome65,cardHome66,cardHome67,cardHome68,cardHome69,cardHome70,cardHome71,cardHome72,cardHome73,cardHome74,cardHome75,cardHome76,cardHome77,cardHome78,cardHome79,cardHome80,cardHome81,cardHome82,cardHome83,cardHome84,cardHome85,cardHome86,cardHome87,cardHome88,cardHome89,cardHome90,cardAway1,cardAway2,cardAway3,cardAway4,cardAway5,cardAway6,cardAway7,cardAway8,cardAway9,cardAway10,cardAway11,cardAway12,cardAway13,cardAway14,cardAway15,cardAway16,cardAway17,cardAway18,cardAway19,cardAway20,cardAway21,cardAway22,cardAway23,cardAway24,cardAway25,cardAway26,cardAway27,cardAway28,cardAway29,cardAway30,cardAway31,cardAway32,cardAway33,cardAway34,cardAway35,cardAway36,cardAway37,cardAway38,cardAway39,cardAway40,cardAway41,cardAway42,cardAway43,cardAway44,cardAway45,cardAway46,cardAway47,cardAway48,cardAway49,cardAway50,cardAway51,cardAway52,cardAway53,cardAway54,cardAway55,cardAway56,cardAway57,cardAway58,cardAway59,cardAway60,cardAway61,cardAway62,cardAway63,cardAway64,cardAway65,cardAway66,cardAway67,cardAway68,cardAway69,cardAway70,cardAway71,cardAway72,cardAway73,cardAway74,cardAway75,cardAway76,cardAway77,cardAway78,cardAway79,cardAway80,cardAway81,cardAway82,cardAway83,cardAway84,cardAway85,cardAway86,cardAway87,cardAway88,cardAway89,cardAway90,card_yHome1,card_yHome2,card_yHome3,card_yHome4,card_yHome5,card_yHome6,card_yHome7,card_yHome8,card_yHome9,card_yHome10,card_yHome11,card_yHome12,card_yHome13,card_yHome14,card_yHome15,card_yHome16,card_yHome17,card_yHome18,card_yHome19,card_yHome20,card_yHome21,card_yHome22,card_yHome23,card_yHome24,card_yHome25,card_yHome26,card_yHome27,card_yHome28,card_yHome29,card_yHome30,card_yHome31,card_yHome32,card_yHome33,card_yHome34,card_yHome35,card_yHome36,card_yHome37,card_yHome38,card_yHome39,card_yHome40,card_yHome41,card_yHome42,card_yHome43,card_yHome44,card_yHome45,card_yHome46,card_yHome47,card_yHome48,card_yHome49,card_yHome50,card_yHome51,card_yHome52,card_yHome53,card_yHome54,card_yHome55,card_yHome56,card_yHome57,card_yHome58,card_yHome59,card_yHome60,card_yHome61,card_yHome62,card_yHome63,card_yHome64,card_yHome65,card_yHome66,card_yHome67,card_yHome68,card_yHome69,card_yHome70,card_yHome71,card_yHome72,card_yHome73,card_yHome74,card_yHome75,card_yHome76,card_yHome77,card_yHome78,card_yHome79,card_yHome80,card_yHome81,card_yHome82,card_yHome83,card_yHome84,card_yHome85,card_yHome86,card_yHome87,card_yHome88,card_yHome89,card_yHome90,card_yAway1,card_yAway2,card_yAway3,card_yAway4,card_yAway5,card_yAway6,card_yAway7,card_yAway8,card_yAway9,card_yAway10,card_yAway11,card_yAway12,card_yAway13,card_yAway14,card_yAway15,card_yAway16,card_yAway17,card_yAway18,card_yAway19,card_yAway20,card_yAway21,card_yAway22,card_yAway23,card_yAway24,card_yAway25,card_yAway26,card_yAway27,card_yAway28,card_yAway29,card_yAway30,card_yAway31,card_yAway32,card_yAway33,card_yAway34,card_yAway35,card_yAway36,card_yAway37,card_yAway38,card_yAway39,card_yAway40,card_yAway41,card_yAway42,card_yAway43,card_yAway44,card_yAway45,card_yAway46,card_yAway47,card_yAway48,card_yAway49,card_yAway50,card_yAway51,card_yAway52,card_yAway53,card_yAway54,card_yAway55,card_yAway56,card_yAway57,card_yAway58,card_yAway59,card_yAway60,card_yAway61,card_yAway62,card_yAway63,card_yAway64,card_yAway65,card_yAway66,card_yAway67,card_yAway68,card_yAway69,card_yAway70,card_yAway71,card_yAway72,card_yAway73,card_yAway74,card_yAway75,card_yAway76,card_yAway77,card_yAway78,card_yAway79,card_yAway80,card_yAway81,card_yAway82,card_yAway83,card_yAway84,card_yAway85,card_yAway86,card_yAway87,card_yAway88,card_yAway89,card_yAway90,cornerHome1,cornerHome2,cornerHome3,cornerHome4,cornerHome5,cornerHome6,cornerHome7,cornerHome8,cornerHome9,cornerHome10,cornerHome11,cornerHome12,cornerHome13,cornerHome14,cornerHome15,cornerHome16,cornerHome17,cornerHome18,cornerHome19,cornerHome20,cornerHome21,cornerHome22,cornerHome23,cornerHome24,cornerHome25,cornerHome26,cornerHome27,cornerHome28,cornerHome29,cornerHome30,cornerHome31,cornerHome32,cornerHome33,cornerHome34,cornerHome35,cornerHome36,cornerHome37,cornerHome38,cornerHome39,cornerHome40,cornerHome41,cornerHome42,cornerHome43,cornerHome44,cornerHome45,cornerHome46,cornerHome47,cornerHome48,cornerHome49,cornerHome50,cornerHome51,cornerHome52,cornerHome53,cornerHome54,cornerHome55,cornerHome56,cornerHome57,cornerHome58,cornerHome59,cornerHome60,cornerHome61,cornerHome62,cornerHome63,cornerHome64,cornerHome65,cornerHome66,cornerHome67,cornerHome68,cornerHome69,cornerHome70,cornerHome71,cornerHome72,cornerHome73,cornerHome74,cornerHome75,cornerHome76,cornerHome77,cornerHome78,cornerHome79,cornerHome80,cornerHome81,cornerHome82,cornerHome83,cornerHome84,cornerHome85,cornerHome86,cornerHome87,cornerHome88,cornerHome89,cornerHome90,cornerAway1,cornerAway2,cornerAway3,cornerAway4,cornerAway5,cornerAway6,cornerAway7,cornerAway8,cornerAway9,cornerAway10,cornerAway11,cornerAway12,cornerAway13,cornerAway14,cornerAway15,cornerAway16,cornerAway17,cornerAway18,cornerAway19,cornerAway20,cornerAway21,cornerAway22,cornerAway23,cornerAway24,cornerAway25,cornerAway26,cornerAway27,cornerAway28,cornerAway29,cornerAway30,cornerAway31,cornerAway32,cornerAway33,cornerAway34,cornerAway35,cornerAway36,cornerAway37,cornerAway38,cornerAway39,cornerAway40,cornerAway41,cornerAway42,cornerAway43,cornerAway44,cornerAway45,cornerAway46,cornerAway47,cornerAway48,cornerAway49,cornerAway50,cornerAway51,cornerAway52,cornerAway53,cornerAway54,cornerAway55,cornerAway56,cornerAway57,cornerAway58,cornerAway59,cornerAway60,cornerAway61,cornerAway62,cornerAway63,cornerAway64,cornerAway65,cornerAway66,cornerAway67,cornerAway68,cornerAway69,cornerAway70,cornerAway71,cornerAway72,cornerAway73,cornerAway74,cornerAway75,cornerAway76,cornerAway77,cornerAway78,cornerAway79,cornerAway80,cornerAway81,cornerAway82,cornerAway83,cornerAway84,cornerAway85,cornerAway86,cornerAway87,cornerAway88,cornerAway89,cornerAway90,crossHome1,crossHome2,crossHome3,crossHome4,crossHome5,crossHome6,crossHome7,crossHome8,crossHome9,crossHome10,crossHome11,crossHome12,crossHome13,crossHome14,crossHome15,crossHome16,crossHome17,crossHome18,crossHome19,crossHome20,crossHome21,crossHome22,crossHome23,crossHome24,crossHome25,crossHome26,crossHome27,crossHome28,crossHome29,crossHome30,crossHome31,crossHome32,crossHome33,crossHome34,crossHome35,crossHome36,crossHome37,crossHome38,crossHome39,crossHome40,crossHome41,crossHome42,crossHome43,crossHome44,crossHome45,crossHome46,crossHome47,crossHome48,crossHome49,crossHome50,crossHome51,crossHome52,crossHome53,crossHome54,crossHome55,crossHome56,crossHome57,crossHome58,crossHome59,crossHome60,crossHome61,crossHome62,crossHome63,crossHome64,crossHome65,crossHome66,crossHome67,crossHome68,crossHome69,crossHome70,crossHome71,crossHome72,crossHome73,crossHome74,crossHome75,crossHome76,crossHome77,crossHome78,crossHome79,crossHome80,crossHome81,crossHome82,crossHome83,crossHome84,crossHome85,crossHome86,crossHome87,crossHome88,crossHome89,crossHome90,crossAway1,crossAway2,crossAway3,crossAway4,crossAway5,crossAway6,crossAway7,crossAway8,crossAway9,crossAway10,crossAway11,crossAway12,crossAway13,crossAway14,crossAway15,crossAway16,crossAway17,crossAway18,crossAway19,crossAway20,crossAway21,crossAway22,crossAway23,crossAway24,crossAway25,crossAway26,crossAway27,crossAway28,crossAway29,crossAway30,crossAway31,crossAway32,crossAway33,crossAway34,crossAway35,crossAway36,crossAway37,crossAway38,crossAway39,crossAway40,crossAway41,crossAway42,crossAway43,crossAway44,crossAway45,crossAway46,crossAway47,crossAway48,crossAway49,crossAway50,crossAway51,crossAway52,crossAway53,crossAway54,crossAway55,crossAway56,crossAway57,crossAway58,crossAway59,crossAway60,crossAway61,crossAway62,crossAway63,crossAway64,crossAway65,crossAway66,crossAway67,crossAway68,crossAway69,crossAway70,crossAway71,crossAway72,crossAway73,crossAway74,crossAway75,crossAway76,crossAway77,crossAway78,crossAway79,crossAway80,crossAway81,crossAway82,crossAway83,crossAway84,crossAway85,crossAway86,crossAway87,crossAway88,crossAway89,crossAway90,foulcommitHome1,foulcommitHome2,foulcommitHome3,foulcommitHome4,foulcommitHome5,foulcommitHome6,foulcommitHome7,foulcommitHome8,foulcommitHome9,foulcommitHome10,foulcommitHome11,foulcommitHome12,foulcommitHome13,foulcommitHome14,foulcommitHome15,foulcommitHome16,foulcommitHome17,foulcommitHome18,foulcommitHome19,foulcommitHome20,foulcommitHome21,foulcommitHome22,foulcommitHome23,foulcommitHome24,foulcommitHome25,foulcommitHome26,foulcommitHome27,foulcommitHome28,foulcommitHome29,foulcommitHome30,foulcommitHome31,foulcommitHome32,foulcommitHome33,foulcommitHome34,foulcommitHome35,foulcommitHome36,foulcommitHome37,foulcommitHome38,foulcommitHome39,foulcommitHome40,foulcommitHome41,foulcommitHome42,foulcommitHome43,foulcommitHome44,foulcommitHome45,foulcommitHome46,foulcommitHome47,foulcommitHome48,foulcommitHome49,foulcommitHome50,foulcommitHome51,foulcommitHome52,foulcommitHome53,foulcommitHome54,foulcommitHome55,foulcommitHome56,foulcommitHome57,foulcommitHome58,foulcommitHome59,foulcommitHome60,foulcommitHome61,foulcommitHome62,foulcommitHome63,foulcommitHome64,foulcommitHome65,foulcommitHome66,foulcommitHome67,foulcommitHome68,foulcommitHome69,foulcommitHome70,foulcommitHome71,foulcommitHome72,foulcommitHome73,foulcommitHome74,foulcommitHome75,foulcommitHome76,foulcommitHome77,foulcommitHome78,foulcommitHome79,foulcommitHome80,foulcommitHome81,foulcommitHome82,foulcommitHome83,foulcommitHome84,foulcommitHome85,foulcommitHome86,foulcommitHome87,foulcommitHome88,foulcommitHome89,foulcommitHome90,foulcommitAway1,foulcommitAway2,foulcommitAway3,foulcommitAway4,foulcommitAway5,foulcommitAway6,foulcommitAway7,foulcommitAway8,foulcommitAway9,foulcommitAway10,foulcommitAway11,foulcommitAway12,foulcommitAway13,foulcommitAway14,foulcommitAway15,foulcommitAway16,foulcommitAway17,foulcommitAway18,foulcommitAway19,foulcommitAway20,foulcommitAway21,foulcommitAway22,foulcommitAway23,foulcommitAway24,foulcommitAway25,foulcommitAway26,foulcommitAway27,foulcommitAway28,foulcommitAway29,foulcommitAway30,foulcommitAway31,foulcommitAway32,foulcommitAway33,foulcommitAway34,foulcommitAway35,foulcommitAway36,foulcommitAway37,foulcommitAway38,foulcommitAway39,foulcommitAway40,foulcommitAway41,foulcommitAway42,foulcommitAway43,foulcommitAway44,foulcommitAway45,foulcommitAway46,foulcommitAway47,foulcommitAway48,foulcommitAway49,foulcommitAway50,foulcommitAway51,foulcommitAway52,foulcommitAway53,foulcommitAway54,foulcommitAway55,foulcommitAway56,foulcommitAway57,foulcommitAway58,foulcommitAway59,foulcommitAway60,foulcommitAway61,foulcommitAway62,foulcommitAway63,foulcommitAway64,foulcommitAway65,foulcommitAway66,foulcommitAway67,foulcommitAway68,foulcommitAway69,foulcommitAway70,foulcommitAway71,foulcommitAway72,foulcommitAway73,foulcommitAway74,foulcommitAway75,foulcommitAway76,foulcommitAway77,foulcommitAway78,foulcommitAway79,foulcommitAway80,foulcommitAway81,foulcommitAway82,foulcommitAway83,foulcommitAway84,foulcommitAway85,foulcommitAway86,foulcommitAway87,foulcommitAway88,foulcommitAway89,foulcommitAway90,goalHome1,goalHome2,goalHome3,goalHome4,goalHome5,goalHome6,goalHome7,goalHome8,goalHome9,goalHome10,goalHome11,goalHome12,goalHome13,goalHome14,goalHome15,goalHome16,goalHome17,goalHome18,goalHome19,goalHome20,goalHome21,goalHome22,goalHome23,goalHome24,goalHome25,goalHome26,goalHome27,goalHome28,goalHome29,goalHome30,goalHome31,goalHome32,goalHome33,goalHome34,goalHome35,goalHome36,goalHome37,goalHome38,goalHome39,goalHome40,goalHome41,goalHome42,goalHome43,goalHome44,goalHome45,goalHome46,goalHome47,goalHome48,goalHome49,goalHome50,goalHome51,goalHome52,goalHome53,goalHome54,goalHome55,goalHome56,goalHome57,goalHome58,goalHome59,goalHome60,goalHome61,goalHome62,goalHome63,goalHome64,goalHome65,goalHome66,goalHome67,goalHome68,goalHome69,goalHome70,goalHome71,goalHome72,goalHome73,goalHome74,goalHome75,goalHome76,goalHome77,goalHome78,goalHome79,goalHome80,goalHome81,goalHome82,goalHome83,goalHome84,goalHome85,goalHome86,goalHome87,goalHome88,goalHome89,goalHome90,goalAway1,goalAway2,goalAway3,goalAway4,goalAway5,goalAway6,goalAway7,goalAway8,goalAway9,goalAway10,goalAway11,goalAway12,goalAway13,goalAway14,goalAway15,goalAway16,goalAway17,goalAway18,goalAway19,goalAway20,goalAway21,goalAway22,goalAway23,goalAway24,goalAway25,goalAway26,goalAway27,goalAway28,goalAway29,goalAway30,goalAway31,goalAway32,goalAway33,goalAway34,goalAway35,goalAway36,goalAway37,goalAway38,goalAway39,goalAway40,goalAway41,goalAway42,goalAway43,goalAway44,goalAway45,goalAway46,goalAway47,goalAway48,goalAway49,goalAway50,goalAway51,goalAway52,goalAway53,goalAway54,goalAway55,goalAway56,goalAway57,goalAway58,goalAway59,goalAway60,goalAway61,goalAway62,goalAway63,goalAway64,goalAway65,goalAway66,goalAway67,goalAway68,goalAway69,goalAway70,goalAway71,goalAway72,goalAway73,goalAway74,goalAway75,goalAway76,goalAway77,goalAway78,goalAway79,goalAway80,goalAway81,goalAway82,goalAway83,goalAway84,goalAway85,goalAway86,goalAway87,goalAway88,goalAway89,goalAway90,shotoffHome1,shotoffHome2,shotoffHome3,shotoffHome4,shotoffHome5,shotoffHome6,shotoffHome7,shotoffHome8,shotoffHome9,shotoffHome10,shotoffHome11,shotoffHome12,shotoffHome13,shotoffHome14,shotoffHome15,shotoffHome16,shotoffHome17,shotoffHome18,shotoffHome19,shotoffHome20,shotoffHome21,shotoffHome22,shotoffHome23,shotoffHome24,shotoffHome25,shotoffHome26,shotoffHome27,shotoffHome28,shotoffHome29,shotoffHome30,shotoffHome31,shotoffHome32,shotoffHome33,shotoffHome34,shotoffHome35,shotoffHome36,shotoffHome37,shotoffHome38,shotoffHome39,shotoffHome40,shotoffHome41,shotoffHome42,shotoffHome43,shotoffHome44,shotoffHome45,shotoffHome46,shotoffHome47,shotoffHome48,shotoffHome49,shotoffHome50,shotoffHome51,shotoffHome52,shotoffHome53,shotoffHome54,shotoffHome55,shotoffHome56,shotoffHome57,shotoffHome58,shotoffHome59,shotoffHome60,shotoffHome61,shotoffHome62,shotoffHome63,shotoffHome64,shotoffHome65,shotoffHome66,shotoffHome67,shotoffHome68,shotoffHome69,shotoffHome70,shotoffHome71,shotoffHome72,shotoffHome73,shotoffHome74,shotoffHome75,shotoffHome76,shotoffHome77,shotoffHome78,shotoffHome79,shotoffHome80,shotoffHome81,shotoffHome82,shotoffHome83,shotoffHome84,shotoffHome85,shotoffHome86,shotoffHome87,shotoffHome88,shotoffHome89,shotoffHome90,shotoffAway1,shotoffAway2,shotoffAway3,shotoffAway4,shotoffAway5,shotoffAway6,shotoffAway7,shotoffAway8,shotoffAway9,shotoffAway10,shotoffAway11,shotoffAway12,shotoffAway13,shotoffAway14,shotoffAway15,shotoffAway16,shotoffAway17,shotoffAway18,shotoffAway19,shotoffAway20,shotoffAway21,shotoffAway22,shotoffAway23,shotoffAway24,shotoffAway25,shotoffAway26,shotoffAway27,shotoffAway28,shotoffAway29,shotoffAway30,shotoffAway31,shotoffAway32,shotoffAway33,shotoffAway34,shotoffAway35,shotoffAway36,shotoffAway37,shotoffAway38,shotoffAway39,shotoffAway40,shotoffAway41,shotoffAway42,shotoffAway43,shotoffAway44,shotoffAway45,shotoffAway46,shotoffAway47,shotoffAway48,shotoffAway49,shotoffAway50,shotoffAway51,shotoffAway52,shotoffAway53,shotoffAway54,shotoffAway55,shotoffAway56,shotoffAway57,shotoffAway58,shotoffAway59,shotoffAway60,shotoffAway61,shotoffAway62,shotoffAway63,shotoffAway64,shotoffAway65,shotoffAway66,shotoffAway67,shotoffAway68,shotoffAway69,shotoffAway70,shotoffAway71,shotoffAway72,shotoffAway73,shotoffAway74,shotoffAway75,shotoffAway76,shotoffAway77,shotoffAway78,shotoffAway79,shotoffAway80,shotoffAway81,shotoffAway82,shotoffAway83,shotoffAway84,shotoffAway85,shotoffAway86,shotoffAway87,shotoffAway88,shotoffAway89,shotoffAway90,shotonHome1,shotonHome2,shotonHome3,shotonHome4,shotonHome5,shotonHome6,shotonHome7,shotonHome8,shotonHome9,shotonHome10,shotonHome11,shotonHome12,shotonHome13,shotonHome14,shotonHome15,shotonHome16,shotonHome17,shotonHome18,shotonHome19,shotonHome20,shotonHome21,shotonHome22,shotonHome23,shotonHome24,shotonHome25,shotonHome26,shotonHome27,shotonHome28,shotonHome29,shotonHome30,shotonHome31,shotonHome32,shotonHome33,shotonHome34,shotonHome35,shotonHome36,shotonHome37,shotonHome38,shotonHome39,shotonHome40,shotonHome41,shotonHome42,shotonHome43,shotonHome44,shotonHome45,shotonHome46,shotonHome47,shotonHome48,shotonHome49,shotonHome50,shotonHome51,shotonHome52,shotonHome53,shotonHome54,shotonHome55,shotonHome56,shotonHome57,shotonHome58,shotonHome59,shotonHome60,shotonHome61,shotonHome62,shotonHome63,shotonHome64,shotonHome65,shotonHome66,shotonHome67,shotonHome68,shotonHome69,shotonHome70,shotonHome71,shotonHome72,shotonHome73,shotonHome74,shotonHome75,shotonHome76,shotonHome77,shotonHome78,shotonHome79,shotonHome80,shotonHome81,shotonHome82,shotonHome83,shotonHome84,shotonHome85,shotonHome86,shotonHome87,shotonHome88,shotonHome89,shotonHome90,shotonAway1,shotonAway2,shotonAway3,shotonAway4,shotonAway5,shotonAway6,shotonAway7,shotonAway8,shotonAway9,shotonAway10,shotonAway11,shotonAway12,shotonAway13,shotonAway14,shotonAway15,shotonAway16,shotonAway17,shotonAway18,shotonAway19,shotonAway20,shotonAway21,shotonAway22,shotonAway23,shotonAway24,shotonAway25,shotonAway26,shotonAway27,shotonAway28,shotonAway29,shotonAway30,shotonAway31,shotonAway32,shotonAway33,shotonAway34,shotonAway35,shotonAway36,shotonAway37,shotonAway38,shotonAway39,shotonAway40,shotonAway41,shotonAway42,shotonAway43,shotonAway44,shotonAway45,shotonAway46,shotonAway47,shotonAway48,shotonAway49,shotonAway50,shotonAway51,shotonAway52,shotonAway53,shotonAway54,shotonAway55,shotonAway56,shotonAway57,shotonAway58,shotonAway59,shotonAway60,shotonAway61,shotonAway62,shotonAway63,shotonAway64,shotonAway65,shotonAway66,shotonAway67,shotonAway68,shotonAway69,shotonAway70,shotonAway71,shotonAway72,shotonAway73,shotonAway74,shotonAway75,shotonAway76,shotonAway77,shotonAway78,shotonAway79,shotonAway80,shotonAway81,shotonAway82,shotonAway83,shotonAway84,shotonAway85,shotonAway86,shotonAway87,shotonAway88,shotonAway89,shotonAway90,throwinHome1,throwinHome2,throwinHome3,throwinHome4,throwinHome5,throwinHome6,throwinHome7,throwinHome8,throwinHome9,throwinHome10,throwinHome11,throwinHome12,throwinHome13,throwinHome14,throwinHome15,throwinHome16,throwinHome17,throwinHome18,throwinHome19,throwinHome20,throwinHome21,throwinHome22,throwinHome23,throwinHome24,throwinHome25,throwinHome26,throwinHome27,throwinHome28,throwinHome29,throwinHome30,throwinHome31,throwinHome32,throwinHome33,throwinHome34,throwinHome35,throwinHome36,throwinHome37,throwinHome38,throwinHome39,throwinHome40,throwinHome41,throwinHome42,throwinHome43,throwinHome44,throwinHome45,throwinHome46,throwinHome47,throwinHome48,throwinHome49,throwinHome50,throwinHome51,throwinHome52,throwinHome53,throwinHome54,throwinHome55,throwinHome56,throwinHome57,throwinHome58,throwinHome59,throwinHome60,throwinHome61,throwinHome62,throwinHome63,throwinHome64,throwinHome65,throwinHome66,throwinHome67,throwinHome68,throwinHome69,throwinHome70,throwinHome71,throwinHome72,throwinHome73,throwinHome74,throwinHome75,throwinHome76,throwinHome77,throwinHome78,throwinHome79,throwinHome80,throwinHome81,throwinHome82,throwinHome83,throwinHome84,throwinHome85,throwinHome86,throwinHome87,throwinHome88,throwinHome89,throwinHome90,throwinAway1,throwinAway2,throwinAway3,throwinAway4,throwinAway5,throwinAway6,throwinAway7,throwinAway8,throwinAway9,throwinAway10,throwinAway11,throwinAway12,throwinAway13,throwinAway14,throwinAway15,throwinAway16,throwinAway17,throwinAway18,throwinAway19,throwinAway20,throwinAway21,throwinAway22,throwinAway23,throwinAway24,throwinAway25,throwinAway26,throwinAway27,throwinAway28,throwinAway29,throwinAway30,throwinAway31,throwinAway32,throwinAway33,throwinAway34,throwinAway35,throwinAway36,throwinAway37,throwinAway38,throwinAway39,throwinAway40,throwinAway41,throwinAway42,throwinAway43,throwinAway44,throwinAway45,throwinAway46,throwinAway47,throwinAway48,throwinAway49,throwinAway50,throwinAway51,throwinAway52,throwinAway53,throwinAway54,throwinAway55,throwinAway56,throwinAway57,throwinAway58,throwinAway59,throwinAway60,throwinAway61,throwinAway62,throwinAway63,throwinAway64,throwinAway65,throwinAway66,throwinAway67,throwinAway68,throwinAway69,throwinAway70,throwinAway71,throwinAway72,throwinAway73,throwinAway74,throwinAway75,throwinAway76,throwinAway77,throwinAway78,throwinAway79,throwinAway80,throwinAway81,throwinAway82,throwinAway83,throwinAway84,throwinAway85,throwinAway86,throwinAway87,throwinAway88,throwinAway89,throwinAway90,Outcome,Home_overall_mean,Away_overall_mean
+1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,1,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,2,0,0,0,0,0,0,0,0,0,2,1,0,0,0,0,0,0,0,2,0,0,0,0,0,2,0,2,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,2,0,0,3,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,2,0,0,0,0,0,0,0,0,0,0,2,0,0,0,2,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,1,0,0,0,0,0,1,0,0,0,1,0,0,0,0,0,0,0,0,0,1,0,1,1,0,0,0,0,0,0,0,1,0,0,1,2,0,0,0,0,0,1,0,0,1,0,0,0,0,1,0,0,0,1,0,0,0,1,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,1,0,0,0,0,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,2,0,0,0,0,0,0,0,0,0,0,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,1,0,0,1,0,0,0,0,0,0,0,0,1,0,1,0,0,0,0,0,0,0,1,0,1,0,1,1,0,0,0,0,0,1,0,1,1,1,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,1,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,2,1,0,0,0,0,0,0,0,0,0,2,0,0,0,0,0,1,0,0,0,0,2,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,1,0,1,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,1,0,0,0,1,0,0,0,0,0,0,2,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,2,0,0,0,1,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,82.45454545,74.5
+
+================================================
+File: Model_code.Rmd
+================================================
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+library(truncnorm)
+library(magic)
+library(dplyr)
+library(future)
+library(future.apply)
+library(coda)
+library(ggplot2)
+library(ggpubr)
+library(mlr3measures)
+library(tidyr)
+
+load("test_outcome.Rdata") 
+load("test_designmat.Rdata")
+load("d4_unique.Rdata")
+```
+
+#Import data
+
+```{r}
+s14 = read.csv("Finaldata4c_complete.csv")
+
+Dmat1 = s14[,-1] #Input matrix
+Dmat = Dmat1[complete.cases(Dmat1),]
+rownames(Dmat) = seq(length=nrow(Dmat))  
+
+Dmat$intercept = 1 #Adding intercept
+Dmat = cbind(Dmat[,!(names(Dmat) %in% c("Outcome"))],Dmat[,(names(Dmat) %in% c("Outcome"))])
+colnames(Dmat)[1624] <- "Outcome"
+
+Dmat = Dmat[,-c(1441:1620)] #Remove 180 throwin variables
+
+set.seed(83)
+rownum =sample(1:nrow(Dmat),nrow(Dmat)/10,replace = FALSE)
+test = Dmat[rownum,]
+train = Dmat[-rownum,]
+
+N = nrow(Dmat) #Total obs
+P = ncol(Dmat) - 1 #No. of covariates
+Z = train[,P+1] + 2 # +2 done for L1 & L2 calc ease (Changing outcome from -1,0,1 to 1,2,3)
+J = length(unique(Z)) #No of outcome categories
+truez = test[,(P+1)] #True values in test dataset (Still contains -1,0,1 as outcome)(Will need to change to 1,2,3 for comparison)
+
+X_char11 = train[,-c(P+1)]
+
+ar1_cor <- function(n, rho) {
+exponent <- abs(matrix(1:n - 1, nrow = n, ncol = n, byrow = TRUE) - 
+    (1:n - 1))
+exp(rho*exponent)
+}
+
+mean_delta = 0 
+betasd = 10
+```
+
+#Model function
+
+```{r}
+mcmc_1 = function(k,c,y_sd,stdnorm){
+
+X_char1 = X_char11[,c(1:k,91:(k+90),181:(180+k),271:(270+k),361:(360+k),451:(450+k),541:(540+k),631:(630+k),721:(720+k),811:(810+k),901:(900+k),991:(990+k),1081:(1080+k),1171:(1170+k),1261:(1260+k),1351:(1350+k),1441,1442,1443)] 
+  
+d01 = colnames(X_char1[, colSums(X_char1 != 0) > 0])
+d02 = setdiff(colnames(X_char1),d01)
+d03 = colnames(Dmat[, colSums(Dmat != 0) > 0])
+d04 = setdiff(colnames(Dmat),d03)
+common = intersect(d02,d04)  
+d4_unique = common
+
+X_char = X_char1 %>% dplyr::select(-d4_unique) 
+  
+d_home = grep("Home",d4_unique,value = TRUE) 
+d_away = setdiff(d4_unique,d_home)
+  
+X_char = as.matrix(X_char)
+X1 = matrix(as.numeric(X_char),ncol = ncol(X_char))
+X1 = data.frame(X1)
+colnames(X1) <- colnames(X_char)
+X1 = as.matrix(X1)
+X11 = scale(X1)
+all_zeros = colnames(X11)[apply(X11, 2, anyNA)]
+X11[,c(all_zeros)] <- X1[,c(all_zeros)]
+X = X11
+N1 = nrow(X)
+P1 = ncol(X_char)
+  
+#-------------------------------------------------------------
+#-------------------------------------------------------------
+  
+#Prior for Betas
+c = c #Put sd here not variance
+c1 = 1
+M1a = c1*ar1_cor(k - length(d_home),-0.3567)
+M1h = c1*ar1_cor(k - length(d_away),-0.3567)
+M2 = c1*ar1_cor(k,-0.3567)
+M22 = kronecker(diag(1,14), M2)
+M3 = matrix(c(c1,0,0,0,c1,0,0,0,c1),ncol = 3)
+sigma_not = adiag(M1h,M1a,M22,M3)
+  
+beta_not = c(rep(0,k - length(d_home)),rep(0,k - length(d_away)), #Red cards
+               rep(0,k),rep(0,k),                                   #Yellow cards
+               rep(0,k),rep(0,k),                                   #Corner
+               rep(0,k),rep(0,k),                                   #Cross
+               rep(0,k),rep(0,k),                                     #Foul
+               rep(0,k),rep(0,k),                                  #Goal
+               rep(0,k),rep(0,k),                                      #Shotoff
+               rep(0,k),rep(0,k),                                   #Shoton
+               0,0,0)                                                 #H/A strength,intercept
+  
+beta_not = as.matrix(beta_not)
+Inv_sigma_not = solve(sigma_not)
+  
+#-------------------------------------------------------------
+
+alphavec = rep(1,J) #Posterior sampling from Beta(1,1)
+
+#-------------------------------------------------------------
+#-------------------------------------------------------------
+
+Beta = c(rnorm(k-length(d_home),mean=-40,sd=betasd),rnorm(k-length(d_away),mean=40,sd=betasd), #Red
+           rnorm(k,mean=-10,sd=betasd),rnorm(k,mean=10,sd=betasd),     #Yellow
+           rnorm(k,mean=20,sd=betasd),rnorm(k,mean=-20,sd=betasd),     #Corner
+           rnorm(k,mean=-10,sd=betasd),rnorm(k,mean=10,sd=betasd),     #Cross
+           rnorm(k,mean=-4,sd=betasd),rnorm(k,mean=4,sd=betasd),       #Foul
+           rnorm(k,mean=100,sd=betasd),rnorm(k,mean=-80,sd=betasd),    #Goal
+           rnorm(k,mean=0,sd=betasd),rnorm(k,mean=0,sd=betasd),        #Shotoff
+           rnorm(k,mean=10,sd=betasd),rnorm(k,mean=-10,sd=betasd),     #Shoton
+           rnorm(1,mean=5,sd=betasd),rnorm(1,mean=-3,sd=betasd),       #H/A Strength,Intercept
+           rnorm(1,mean=0,sd=betasd)) #Initial values for beta coefficients for computing Ymean
+n_param = length(Beta)
+  
+deltavec = c((-0.43*stdnorm),(0.43*stdnorm))
+deltavec = sort(deltavec)
+deltavec = c(-Inf,deltavec,Inf) 
+ 
+#-------------------------------------------------------------
+#-------------------------------------------------------------  
+   
+#Posterior Sampling
+
+deltamat = vector(mode="numeric",length=0)
+
+betamat = matrix(data=NA,nrow=length(Beta),ncol=11000)
+
+
+niter = 11000 #No of iterations of Gibbs sampling
+
+post_var = solve( (y_sd^(-2))*t(X)%*%X + (c^(-2))*Inv_sigma_not )
+post_var_chol = chol(post_var)
+  
+for(i in 1:niter)
+{
+L1 = deltavec[Z] 
+L2 = deltavec[Z+1] 
+ymean = X%*%Beta 
+y = rtruncnorm(N1,a = L1, b = L2, mean = ymean, sd = y_sd) 
+y = as.matrix(y)
+
+post_mean = as.numeric((y_sd^(-2))*post_var%*%(t(X)%*%y + Inv_sigma_not %*% beta_not))
+Beta = colSums(t(post_var_chol)*rnorm(n_param)) + post_mean 
+Beta = matrix(Beta,nrow = n_param,ncol = 1)
+
+betamat[,i] = Beta
+  
+for(j in 1:(J-1)) 
+{
+ycat1 = y[Z==j];c1 = max(ycat1)
+ycat2 = y[Z==j+1];c2 = min(ycat2)
+a1 = pnorm(deltavec[j],mean=0,stdnorm) #Between 0 and 1
+b1 = pnorm(deltavec[j+2],mean=0,stdnorm) #Between 0 and 1
+w1 = (pnorm(c1,0,stdnorm)-a1)/(b1-a1) #w1 is less than 1
+w2 = (pnorm(c2,0,stdnorm)-a1)/(b1-a1) #w2 is greater w1
+w = ifelse(w2>w1,runif(1,min = w1,max = w2),ifelse(w2 == w1, w1, runif(1,min = w2,max = w1)))
+prob_inv = ((b1-a1)*w)+a1
+deltavec[j+1] = qnorm(prob_inv,mean=mean_delta,stdnorm)
+} #Delta loop close   
+  
+deltamat = cbind(deltamat,deltavec[2:3])
+
+} #Iteration loop close
+
+outputt = list(deltamat,betamat,rownum,d4_unique)
+}
+```
+
+```{r}
+mcmc_2 = function(k,c,y_sd,stdnorm){
+
+X_char1 = X_char11[,c(1:k,91:(k+90),181:(180+k),271:(270+k),361:(360+k),451:(450+k),541:(540+k),631:(630+k),721:(720+k),811:(810+k),901:(900+k),991:(990+k),1081:(1080+k),1171:(1170+k),1261:(1260+k),1351:(1350+k),1441,1442,1443)] 
+  
+d01 = colnames(X_char1[, colSums(X_char1 != 0) > 0])
+d02 = setdiff(colnames(X_char1),d01)
+d03 = colnames(Dmat[, colSums(Dmat != 0) > 0])
+d04 = setdiff(colnames(Dmat),d03)
+common = intersect(d02,d04)  
+d4_unique = common
+
+X_char = X_char1 %>% dplyr::select(-d4_unique) 
+  
+d_home = grep("Home",d4_unique,value = TRUE) 
+d_away = setdiff(d4_unique,d_home)
+  
+X_char = as.matrix(X_char)
+X1 = matrix(as.numeric(X_char),ncol = ncol(X_char))
+X1 = data.frame(X1)
+colnames(X1) <- colnames(X_char)
+X1 = as.matrix(X1)
+X11 = scale(X1)
+all_zeros = colnames(X11)[apply(X11, 2, anyNA)]
+X11[,c(all_zeros)] <- X1[,c(all_zeros)]
+X = X11
+N1 = nrow(X)
+P1 = ncol(X_char)
+  
+#-------------------------------------------------------------
+#-------------------------------------------------------------
+  
+#Prior for Betas
+c = c #Put sd here not variance
+c1 = 1
+M1a = c1*ar1_cor(k - length(d_home),-0.3567)
+M1h = c1*ar1_cor(k - length(d_away),-0.3567)
+M2 = c1*ar1_cor(k,-0.3567)
+M22 = kronecker(diag(1,14), M2)
+M3 = matrix(c(c1,0,0,0,c1,0,0,0,c1),ncol = 3)
+sigma_not = adiag(M1h,M1a,M22,M3)
+  
+beta_not = c(rep(0,k - length(d_home)),rep(0,k - length(d_away)), #Red cards
+               rep(0,k),rep(0,k),                                   #Yellow cards
+               rep(0,k),rep(0,k),                                   #Corner
+               rep(0,k),rep(0,k),                                   #Cross
+               rep(0,k),rep(0,k),                                     #Foul
+               rep(0,k),rep(0,k),                                  #Goal
+               rep(0,k),rep(0,k),                                      #Shotoff
+               rep(0,k),rep(0,k),                                   #Shoton
+               0,0,0)                                                 #H/A strength,intercept
+  
+beta_not = as.matrix(beta_not)
+Inv_sigma_not = solve(sigma_not)
+  
+#-------------------------------------------------------------
+
+alphavec = rep(1,J) #Posterior sampling from Beta(1,1)
+
+#-------------------------------------------------------------
+#-------------------------------------------------------------
+
+Beta = c(rnorm(k-length(d_home),mean=-40,sd=betasd),rnorm(k-length(d_away),mean=40,sd=betasd), #Red
+           rnorm(k,mean=-10,sd=betasd),rnorm(k,mean=10,sd=betasd),     #Yellow
+           rnorm(k,mean=20,sd=betasd),rnorm(k,mean=-20,sd=betasd),     #Corner
+           rnorm(k,mean=-10,sd=betasd),rnorm(k,mean=10,sd=betasd),     #Cross
+           rnorm(k,mean=-4,sd=betasd),rnorm(k,mean=4,sd=betasd),       #Foul
+           rnorm(k,mean=100,sd=betasd),rnorm(k,mean=-80,sd=betasd),    #Goal
+           rnorm(k,mean=0,sd=betasd),rnorm(k,mean=0,sd=betasd),        #Shotoff
+           rnorm(k,mean=10,sd=betasd),rnorm(k,mean=-10,sd=betasd),     #Shoton
+           rnorm(1,mean=5,sd=betasd),rnorm(1,mean=-3,sd=betasd),       #H/A Strength,Intercept
+           rnorm(1,mean=0,sd=betasd)) #Initial values for beta coefficients for computing Ymean
+n_param = length(Beta)
+  
+deltavec = c((-0.43*stdnorm),(0.43*stdnorm))
+deltavec = sort(deltavec)
+deltavec = c(-Inf,deltavec,Inf) 
+ 
+#-------------------------------------------------------------
+#-------------------------------------------------------------  
+   
+#Posterior Sampling
+
+deltamat = vector(mode="numeric",length=0)
+delta_diag1 = vector(mode="numeric",length=0)
+delta_diag2 = vector(mode="numeric",length=0)
+
+betamat = matrix(data=NA,nrow=length(Beta),ncol=300000)
+
+
+niter = 300000 #No of iterations of Gibbs sampling
+
+post_var = solve( (y_sd^(-2))*t(X)%*%X + (c^(-2))*Inv_sigma_not )
+post_var_chol = chol(post_var)
+  
+for(i in 1:niter)
+{
+L1 = deltavec[Z] 
+L2 = deltavec[Z+1] 
+ymean = X%*%Beta 
+y = rtruncnorm(N1,a = L1, b = L2, mean = ymean, sd = y_sd) 
+y = as.matrix(y)
+
+post_mean = as.numeric((y_sd^(-2))*post_var%*%(t(X)%*%y + Inv_sigma_not %*% beta_not))
+Beta = colSums(t(post_var_chol)*rnorm(n_param)) + post_mean 
+Beta = matrix(Beta,nrow = n_param,ncol = 1)
+
+betamat[,i] = Beta
+  
+for(j in 1:(J-1)) 
+{
+ycat1 = y[Z==j];c1 = max(ycat1)
+ycat2 = y[Z==j+1];c2 = min(ycat2)
+a1 = pnorm(deltavec[j],mean=0,stdnorm) #Between 0 and 1
+b1 = pnorm(deltavec[j+2],mean=0,stdnorm) #Between 0 and 1
+w1 = (pnorm(c1,0,stdnorm)-a1)/(b1-a1) #w1 is less than 1
+w2 = (pnorm(c2,0,stdnorm)-a1)/(b1-a1) #w2 is greater w1
+w = ifelse(w2>w1,runif(1,min = w1,max = w2),ifelse(w2 == w1, w1, runif(1,min = w2,max = w1)))
+prob_inv = ((b1-a1)*w)+a1
+deltavec[j+1] = qnorm(prob_inv,mean=mean_delta,stdnorm)
+} #Delta loop close   
+  
+deltamat = cbind(deltamat,deltavec[2:3])
+
+delta_diag1 = ifelse(i > 10000 & i%%1000 == 0,geweke.diag(deltamat[1,],frac1 = 0.9,frac2 = 0.1)$z,NA)
+delta_diag2 = ifelse(i > 10000 & i%%1000 == 0,geweke.diag(deltamat[2,],frac1 = 0.9,frac2 = 0.1)$z,NA)
+
+if(i > 10000 & i%%1000 == 0 & abs(delta_diag2) < 1.96 & abs(delta_diag1) < 1.96){
+  break
+}
+
+} #Iteration loop close
+
+outputt = list(deltamat,betamat,rownum,d4_unique)
+}
+```
+
+# Sequential code
+
+```{r message=FALSE, warning=FALSE}
+start.time = Sys.time()
+
+plan(multisession,workers = 15) 
+Models <- c(1:25)
+data <- future_lapply(Models, future.scheduling = 1.0,future.seed = TRUE, function(k) {
+set.seed(83)  
+mcmc_2(k,c=0.5,y_sd = 14,stdnorm = 200) 
+})
+
+end.time = Sys.time()
+time = start.time - end.time
+time
+
+saveRDS(data, sprintf("model_result_A.rds"))
+```
+
+```{r message=FALSE, warning=FALSE}
+start.time = Sys.time()
+
+plan(multisession,workers = 15) 
+Models <- c(26:90)
+data1 <- future_lapply(Models, future.scheduling = 1.0,future.seed = TRUE, function(k) {
+set.seed(83)  
+mcmc_1(k,c=0.5,y_sd = 14,stdnorm = 200) 
+})
+
+end.time = Sys.time()
+time = start.time - end.time
+time
+
+saveRDS(data1, sprintf("model_result_B.rds"))
+```
+
+```{r}
+#merge data and data1 after cleaning data betamat and deltamat
+library(dplyr)
+for(i in 1:25){
+  len = length(data[[i]][[1]][1,])
+  data[[i]][[2]] = subset(data[[i]][[2]], select = c(1:len))
+}
+
+data2 = c(data,data1)
+
+saveRDS(data2, sprintf("model_result.rds"))
+```
+
+
+```{r message=FALSE, warning=FALSE}
+y_sd = 14
+models=90
+
+yprobvec_d = array()
+yprobvec_l = array()
+yprobvec_w = array()  
+
+outcome = list()
+
+for(k in 1:models){
+  
+a = data[[k]][[2]]
+a2 = ncol(a)
+a3 = t(a[,c(seq(1,a2,10))])
+a4 = tail(a3,100)
+beta_mean = colMeans(a4) 
+
+a = data[[k]][[1]]
+a2 = ncol(a)
+a3 = t(a[,c(seq(1,a2,10))])
+a4 = tail(a3,100)
+delta_mean = colMeans(a4) 
+
+xnew1 = test_designmat
+xnew1 = xnew1[,c(1:k,91:(k+90),181:(180+k),271:(270+k),361:(360+k),451:(450+k),541:(540+k),631:(630+k),721:(720+k),811:(810+k),901:(900+k),991:(990+k),1081:(1080+k),1171:(1170+k),1261:(1260+k),1351:(1350+k),1441,1442,1443)] 
+xnew1 = xnew1 %>% dplyr::select(-d4_unique[[k]])
+xnew1 = as.matrix(xnew1)
+xnew = scale(xnew1)
+all_zeros1 = colnames(xnew)[apply(xnew, 2, anyNA)]
+xnew[,c(all_zeros1)] <- xnew1[,c(all_zeros1)]
+
+Y_pred = xnew %*% beta_mean 
+Y_pred_cat_low = ifelse(Y_pred <= delta_mean[1],-1,ifelse(delta_mean[1] < Y_pred & Y_pred <= delta_mean[2],0,1)) 
+  
+pred_prob = as.vector(Y_pred_cat_low) 
+
+#Predicted Probability of winning over time
+deltahatvec =c(-Inf,delta_mean[1],delta_mean[2],Inf)
+for(m in 1:length(Y_pred)) {
+  yprob = pnorm(deltahatvec,mean =Y_pred[m],sd=y_sd) 
+  yprob = diff(yprob)
+  yprobvec_w[m] = yprob[3] #Probability of winning at time k for each match m
+  yprobvec_d[m] = yprob[2] #Probability of drawing at time k for each match m
+  yprobvec_l[m] = yprob[1] #Probability of losing at time k for each match m
+}
+
+outcome[[k]] = list(pred_prob,yprobvec_w,yprobvec_d,yprobvec_l,beta_mean,delta_mean,d4_unique[[k]])
+}
+
+data1 = list()
+data1 <- outcome
+remove(outcome)
+
+saveRDS(data1, sprintf("model_metrics.rds"))
+```
+
+
+
+
+================================================
+File: all_incidents.csv
+================================================
+id,type,subtype2,subtype1,player1,player2,team,lon,lat,elapsed,elapsed_plus,game_id
+378998,goal,header,n,37799,38807,10261,NA,NA,22,NA,1729
+379019,goal,shot,n,24148,24154,10260,NA,NA,24,NA,1729
+
+================================================
+File: extract_data_sqlite.R
+================================================
+
+setwd()
+
+library(xml2)
+library(RSQLite)
+library(magrittr)
+library(viridis)
+library(tibble)
+library(purrr)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(pander)
+library(tidyverse)
+
+panderOptions('table.split.table', Inf)
+
+# read the data
+con = dbConnect(drv=RSQLite::SQLite(), dbname="Raw data and code/database.sqlite")
+
+alltables = dbListTables(con)
+tables <- alltables[alltables != "sqlite_sequence"]
+
+lDataFrames <- vector("list", length=length(tables))
+
+
+# create a data.frame for each table
+for (i in seq(along=tables)) {
+  lDataFrames[[i]] <- dbGetQuery(conn=con, statement=paste("SELECT * FROM '", tables[[i]], "'", sep=""))
+}
+matchdetails <- lDataFrames[[3]]
+
+
+# choose which league and season to work on
+db  <- src_sqlite("database.sqlite")
+matches <- tbl(db, 'Match') %>% filter(country_id == 1729) # this is for EPL
+
+
+# Loop over all matches and put the info into a dataframe
+
+value_from_xpath  <- function(element, xpath, to.int = F, index = 1) {
+  xml_find_all(element, xpath) %>%
+    {ifelse(length(.), xml_text(.[[index]]), NA)} %>%
+    {ifelse(to.int, as.integer(.), .)}
+}
+
+node_to_dataframe <- function(n, key) {
+  tibble_(list(
+    id = ~value_from_xpath(n, './id', to.int = T),
+    type = ~value_from_xpath(n, './type'),
+    subtype1 = ~value_from_xpath(n, './subtype'),
+    subtype2 = ~value_from_xpath(n, paste0('./', key, '_type')),
+    player1 = ~value_from_xpath(n, './player1'),
+    player2 = ~value_from_xpath(n, './player2'),
+    team = ~value_from_xpath(n, './team'),
+    lon = ~value_from_xpath(n, './coordinates/value', to.int = T, index = 1),
+    lat = ~value_from_xpath(n, './coordinates/value', to.int = T, index = 2),
+    elapsed = ~value_from_xpath(n, './elapsed', T),
+    elapsed_plus = ~value_from_xpath(n, './elapsed_plus', T)
+  ))
+}
+
+# note: list of events: 'goal','shoton','shotoff','foulcommit','card','cross','corner','possession'
+# you can choose whichever events you want to use in your analysis
+
+incidents <- map_df(list('goal','shoton','shotoff','foulcommit','card','cross','corner','possession'), function(key) {
+  matches %>%
+    filter_(paste0('!is.na(', key, ')')) %>% 
+    select_('id', key) %>%
+    collect() %>% 
+    rename_('value' = key) %>%
+    pmap_df(function(id, value) {
+      xml <- read_xml(value)
+      df  <- xml %>%
+        xml_find_all(paste0('/', key, '/value')) %>%
+        map_df(node_to_dataframe, key)
+      
+      # Add the id of the game as 'foreign key' game_id
+      if (nrow(df) > 0){
+        if (length(xml_find_all(xml, paste0('/', key, '/value/', key, '_type'))) > 0) {
+          df %<>%
+            rename(tmp = subtype1) %>%
+            rename(subtype1 = subtype2) %>%
+            rename(subtype2 = tmp)
+        }
+        df$game_id  <- id
+      }
+      return(df)
+    })
+})
+
+eplmatches = matchdetails %>% filter(league_id == 1729)
+
+write.csv(eplmatches,"EPL_data/matchdetails.csv",row.names = F)
+write.csv(incidents,"EPL_data/all_incidents.csv",row.names = F)
+write.csv(lDataFrames[[4]],"EPL_data/players.csv",row.names = F)
+write.csv(lDataFrames[[5]],"EPL_data/player_details.csv",row.names = F)
+write.csv(lDataFrames[[6]],"EPL_data/teams.csv",row.names = F)
+
